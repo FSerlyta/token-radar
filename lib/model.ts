@@ -1,18 +1,21 @@
-// Token Radar's model, radar-2: one sealed snapshot in, one ranked board out.
+// Token Radar's model, radar-3: one sealed snapshot in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds every
 // other pre-token protocol that passes the launch screen: no token on record, not a wrapped, staked or
 // bridged product of a token that trades, not a versioned pool, not an exchange. The snapshot carries
 // no parentProtocol field, so the screen uses exactly the ten fields it does carry.
 //
-// Implied value follows only from the snapshot's own figures. The base multiple is NOT a constant:
-// it is the median market-cap-to-TVL ratio of the tokened protocols in the same category, computed
-// from this snapshot at build time (a category with fewer than five tokened protocols falls back to
-// the global median), clamped to [0.03, 1.00]. The live-token protocols are the market's own pricing
-// reference, never mixed into the ranked board.
+// Implied value follows only from the snapshot's own figures. The base multiple is NOT a constant and
+// NOT a flat fallback: it is the category's own median market-cap-to-TVL ratio, shrunk toward the
+// global median in proportion to how much market sets it — (n x category median + 5 x global median)
+// / (n + 5). A category's median is capped at 1.50x before blending, so one thin-TVL outlier (a single
+// live protocol at 400x, for instance) cannot set the category's price, and floored at 0.005x. A
+// category with no live protocol at all falls back to the global median, and the dashboard says so.
+// The live-token protocols are the market's own pricing reference, never mixed into the ranked board.
 //
-//   multiple     = median(mcap_usd / tvl_usd) over tokened protocols in the category (n >= 5),
-//                  else the global median; clamped to [0.03, 1.00]
+//   multiple     = (n x median_capped + 5 x global) / (n + 5), n = live-token protocols in the category
+//                  (no live protocol in the category: the global median), clamped to [0.03, 1.00]
+//   median_capped = clamp(median(mcap_usd / tvl_usd) over tokened protocols in the category, 0.005, 1.50)
 //   base         = tvl_usd x multiple
 //   growth       = clamp(change_7d, -60, 120) per cent
 //   growthMult   = 1 + (growth / 100) x 0.5
@@ -47,7 +50,9 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them. */
 export interface ModelConstants {
-  min_category_n: number;
+  shrink_k: number;
+  median_cap: number;
+  median_floor: number;
   multiple_floor: number;
   multiple_cap: number;
   growth_weight: number;
@@ -62,7 +67,9 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  min_category_n: 5,
+  shrink_k: 5,
+  median_cap: 1.5,
+  median_floor: 0.005,
   multiple_floor: 0.03,
   multiple_cap: 1.0,
   growth_weight: 0.5,
@@ -76,8 +83,8 @@ export const MODEL: ModelConstants = {
   breadth_max: 1.1,
 };
 
-/** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+/** The model's version label: the dashboard names it. radar-4 adds token odds and expected-value ranking to radar-3's shrunk multiples. */
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -107,13 +114,27 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     base_multiple: number;
+    multiple_n: number;
+    multiple_source: 'category' | 'global';
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
     breadth_multiplier: number;
+    gross_value_usd: number;
+    token_odds: number;
     age_days: number | null;
   };
   farm_steps: string[];
+}
+
+/** A live-token peer the detail view prices a row against: the closest TVL in its category. */
+export interface Peer {
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  mcap_usd: number | null;
+  multiple: number | null;
+  same_category: boolean;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -129,11 +150,17 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  gross_value_usd: number;
+  token_odds: number;
+  verdict: 'FARM' | 'MARGINAL' | 'SKIP';
   multiple: number;
+  multiple_n: number;
+  multiple_source: 'category' | 'global';
   growth_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
   watchlist: boolean;
+  peers: Peer[];
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -153,7 +180,36 @@ export interface MultipleRow {
   category: string;
   n: number;
   median: number;
+  raw_median: number;
   used: boolean;
+}
+
+/** One protocol in the ledger: every protocol in the snapshot, ranked, live or excluded, with the reason. */
+export interface LedgerRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  disposition: 'ranked' | 'live' | 'excluded';
+  reason: string | null;
+}
+
+/** The held-out validation the dashboard shows: token odds and multiples, tested twice each. */
+export interface Validation {
+  odds: {
+    brier: [number, number];
+    base_brier: [number, number];
+    log_loss: [number, number];
+    base_log_loss: [number, number];
+    base_rate: number;
+  };
+  multiples: {
+    mean_log_err: [number, number];
+    global_mean_log_err: [number, number];
+    v1_mean_log_err: [number, number];
+    n: number;
+  };
 }
 
 /** Everything the dashboard needs: the board, the live set, the multiples and the model it runs. */
@@ -173,6 +229,9 @@ export interface RadarData {
   global_n: number;
   rows: RadarRow[];
   live: LiveRow[];
+  ledger: LedgerRow[];
+  ledger_counts: { ranked: number; live: number; excluded: number };
+  validation: Validation;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -233,30 +292,190 @@ export function pricingReference(snapshot: Snapshot): Pricing {
   return { byCategory: priced, global: { n: all.length, median: median(all) } };
 }
 
-/** A protocol's base multiple: its category's median when five or more tokened protocols set it, else the global median, clamped. */
-export function multipleFor(protocol: SnapshotProtocol, pricing: Pricing, model: ModelConstants = MODEL): number {
+/** A protocol's base multiple: its category's median, capped and shrunk toward the global median in
+ *  proportion to how many live protocols set it — (n x median + k x global) / (n + k). A category
+ *  with no live protocol at all falls back to the global median, and says so. */
+export function multipleFor(
+  protocol: SnapshotProtocol,
+  pricing: Pricing,
+  model: ModelConstants = MODEL,
+): { multiple: number; source: 'category' | 'global'; n: number; raw: number | null } {
   const entry = protocol.category === null ? undefined : pricing.byCategory.get(protocol.category);
-  const raw = entry !== undefined && entry.n >= model.min_category_n ? entry.median : pricing.global.median;
-  return Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw));
+  if (entry === undefined) {
+    return { multiple: Math.min(model.multiple_cap, Math.max(model.multiple_floor, pricing.global.median)), source: 'global', n: 0, raw: null };
+  }
+  const raw = Math.min(model.median_cap, Math.max(model.median_floor, entry.median));
+  const shrunk = (entry.n * raw + model.shrink_k * pricing.global.median) / (entry.n + model.shrink_k);
+  return { multiple: Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk)), source: 'category', n: entry.n, raw };
 }
 
-/** The four multipliers and the implied value one protocol gets under `model`. */
+/** Token odds, fitted from the snapshot's own eligible protocols at build time.
+ *
+ *  The odds are the fitted share of protocols like this one that have a token: a logistic
+ *  regression on log TVL, 7-day growth, the category's token share (leave-one-out) and the age
+ *  band, fitted on every protocol that passes the launch screen, tokened or not. The age shape is
+ *  fitted, not assumed: controlling for TVL, growth and category, the odds dip from 0-6 months to
+ *  1-2 years, then rise steeply for protocols over 2 years — older cohorts in this snapshot are
+ *  mostly tokened. That is the peers' record, not a promise that an old protocol without a token
+ *  will launch; the detail view's risk notes say so where it matters.
+ *
+ *  The fit is tested held-out, twice (by slug hash): the Brier score and log-loss on each fold
+ *  against the base rate. The board ranks by expected value, implied x odds. */
+
+/** The eligible population for the odds fit: every protocol that passes the launch screen, tokened or not. */
+export function eligiblePopulation(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter(passesScreen);
+}
+
+/** A protocol's age band for the odds fit. */
+export function ageBand(age: number | null): number {
+  if (age === null) return 5;
+  if (age < 180) return 0;
+  if (age < 365) return 1;
+  if (age < 730) return 2;
+  if (age < 1095) return 3;
+  return 4;
+}
+
+/** The odds model's features: [1, log10 TVL, 7-day growth, category token share, age-band dummies]. */
+export function oddsFeatures(p: SnapshotProtocol, asOf: string, pop: SnapshotProtocol[], baseRate: number): number[] {
+  const age = ageDays(asOf, p.listed_at);
+  const band = ageBand(age);
+  const growth = Math.min(120, Math.max(-60, finite(p.change_7d, 0))) / 100;
+  const same = pop.filter((q) => q !== p && (q.category ?? 'Other') === (p.category ?? 'Other'));
+  const share = same.length === 0 ? baseRate : same.filter((q) => !isPreToken(q)).length / same.length;
+  const f = [1, Math.log10(Math.max(1, p.tvl_usd)), growth, share, 0, 0, 0, 0, 0];
+  if (band >= 1) f[3 + band] = 1;
+  return f;
+}
+
+/** Mean and spread of the fitted features, so the fit is in standardised units. */
+function standardizeRows(rows: number[][]): { mu: number[]; sd: number[] } {
+  const d = rows[0]!.length;
+  const mu = new Array<number>(d).fill(0);
+  const sd = new Array<number>(d).fill(1);
+  for (let j = 1; j <= 3; j++) {
+    let m = 0;
+    for (const r of rows) m += r[j]!;
+    m /= rows.length;
+    mu[j] = m;
+    let v = 0;
+    for (const r of rows) v += (r[j]! - m) ** 2;
+    sd[j] = Math.sqrt(v / rows.length) || 1;
+  }
+  return { mu, sd };
+}
+
+function applyStandardize(rows: number[][], mu: number[], sd: number[]): number[][] {
+  return rows.map((r) => r.map((v, j) => (j >= 1 && j <= 3 ? (v - mu[j]!) / sd[j]! : v)));
+}
+
+function sigmoid(z: number): number {
+  return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+}
+
+/** Logistic regression by gradient descent: fixed start, fixed steps, no randomness, so the fit is reproducible. */
+export function fitLogistic(rows: number[][], y: number[], iters = 4000, lr = 0.1, lambda = 1.0): number[] {
+  const d = rows[0]!.length;
+  const w = new Array<number>(d).fill(0);
+  for (let it = 0; it < iters; it++) {
+    const grad = new Array<number>(d).fill(0);
+    for (let i = 0; i < rows.length; i++) {
+      let z = 0;
+      for (let j = 0; j < d; j++) z += w[j]! * rows[i]![j]!;
+      const e = sigmoid(z) - y[i]!;
+      for (let j = 0; j < d; j++) grad[j]! += e * rows[i]![j]!;
+    }
+    for (let j = 0; j < d; j++) w[j]! -= lr * (grad[j]! / rows.length + (j === 0 ? 0 : (lambda * w[j]!) / rows.length));
+  }
+  return w;
+}
+
+export function predictLogistic(w: number[], x: number[]): number {
+  let z = 0;
+  for (let j = 0; j < w.length; j++) z += w[j]! * x[j]!;
+  return sigmoid(z);
+}
+
+/** A slug's fold: a hash, so the held-out split is the same every run. */
+export function foldOf(slug: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < slug.length; i++) { h ^= slug.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return Math.floor(((h >>> 0) / 4294967296) * 2);
+}
+
+export interface OddsFit {
+  weights: number[];
+  mu: number[];
+  sd: number[];
+  baseRate: number;
+  validation: {
+    brier: [number, number];
+    baseBrier: [number, number];
+    logLoss: [number, number];
+    baseLogLoss: [number, number];
+  };
+  oddsBySlug: Map<string, number>;
+}
+
+/** Fit token odds on the eligible population and test them held-out, twice. */
+export function fitOdds(snapshot: Snapshot): OddsFit {
+  const pop = eligiblePopulation(snapshot);
+  const baseRate = pop.filter((p) => !isPreToken(p)).length / pop.length;
+  const yOf = (p: SnapshotProtocol): number => (isPreToken(p) ? 0 : 1);
+  const brier = (ps: number[], ys: number[]): number => ps.reduce((s, p, i) => s + (p - ys[i]!) ** 2, 0) / ps.length;
+  const logLoss = (ps: number[], ys: number[]): number =>
+    -ps.reduce((s, p, i) => s + ys[i]! * Math.log(Math.max(1e-9, p)) + (1 - ys[i]!) * Math.log(Math.max(1e-9, 1 - p)), 0) / ps.length;
+  const brierFold: [number, number] = [0, 0];
+  const baseBrierFold: [number, number] = [0, 0];
+  const logLossFold: [number, number] = [0, 0];
+  const baseLogLossFold: [number, number] = [0, 0];
+  for (const fold of [0, 1] as const) {
+    const train = pop.filter((p) => foldOf(p.slug) === fold);
+    const test = pop.filter((p) => foldOf(p.slug) !== fold);
+    const rows = train.map((p) => oddsFeatures(p, snapshot.as_of, train, baseRate));
+    const { mu, sd } = standardizeRows(rows);
+    const w = fitLogistic(applyStandardize(rows, mu, sd), train.map(yOf));
+    const ps = test.map((p) => predictLogistic(w, applyStandardize([oddsFeatures(p, snapshot.as_of, train, baseRate)], mu, sd)[0]!));
+    const ys = test.map(yOf);
+    const base = ys.reduce((a, b) => a + b, 0) / ys.length;
+    brierFold[fold] = brier(ps, ys);
+    baseBrierFold[fold] = brier(ys.map(() => base), ys);
+    logLossFold[fold] = logLoss(ps, ys);
+    baseLogLossFold[fold] = logLoss(ys.map(() => base), ys);
+  }
+  const rows = pop.map((p) => oddsFeatures(p, snapshot.as_of, pop, baseRate));
+  const { mu, sd } = standardizeRows(rows);
+  const weights = fitLogistic(applyStandardize(rows, mu, sd), pop.map(yOf));
+  const oddsBySlug = new Map<string, number>();
+  for (const p of pop) {
+    const x = applyStandardize([oddsFeatures(p, snapshot.as_of, pop, baseRate)], mu, sd)[0]!;
+    oddsBySlug.set(p.slug, predictLogistic(weights, x));
+  }
+  return { weights, mu, sd, baseRate, validation: { brier: brierFold, baseBrier: baseBrierFold, logLoss: logLossFold, baseLogLoss: baseLogLossFold }, oddsBySlug };
+}
+
+/** The four multipliers, the token odds, and the expected value one protocol gets under `model`.
+ *  `gross` is the launch value if a token lists; `implied` is gross times the token odds — the
+ *  expected value the board ranks by. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   pricing: Pricing,
+  odds: number,
   model: ModelConstants = MODEL,
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null } {
+): { implied: number; gross: number; odds: number; multiple: number; multiple_n: number; multiple_source: 'category' | 'global'; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const multiple = multipleFor(protocol, pricing, model);
+  const m = multipleFor(protocol, pricing, model);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const breadthMult = Math.min(model.breadth_max, 1 + Math.max(0, protocol.chains.length - 1) * model.breadth_per_chain);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * breadthMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, breadthMult, age };
+  const gross = Math.max(1, Math.round(protocol.tvl_usd * m.multiple * growthMult * maturityMult * breadthMult));
+  const implied = Math.max(1, Math.round(gross * odds));
+  return { implied, gross, odds, multiple: m.multiple, multiple_n: m.n, multiple_source: m.source, growthPct, growthMult, maturityMult, breadthMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -278,12 +497,29 @@ export function isPreToken(p: SnapshotProtocol): boolean {
 
 /** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool, not a wrapped, staked or bridged product. */
 export function isRankable(p: SnapshotProtocol): boolean {
-  if (!isPreToken(p)) return false;
+  return isPreToken(p) && passesScreen(p);
+}
+
+/** The launch screen without the token check: the same exclusions decide the ledger's dispositions. */
+export function passesScreen(p: SnapshotProtocol): boolean {
   if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
   if (VERSIONED.test(p.name)) return false;
   if (WRAPPED_WORD.test(p.name)) return false;
   if (EXCHANGE_PREFIX.test(p.name)) return false;
   return true;
+}
+
+/** Why a protocol is not ranked: the first screen it fails, in the screen's own words. */
+export function excludeReason(p: SnapshotProtocol): string | null {
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) {
+    if (p.category === 'CEX') return 'exchange';
+    if (p.category === 'Bridge' || p.category === 'Canonical Bridge') return 'bridged product';
+    return 'staked product';
+  }
+  if (VERSIONED.test(p.name)) return 'versioned pool';
+  if (WRAPPED_WORD.test(p.name)) return 'wrapped or staked product';
+  if (EXCHANGE_PREFIX.test(p.name)) return 'exchange';
+  return null;
 }
 
 /** The snapshot's protocol by slug. */
@@ -293,10 +529,12 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
+/** The protocols the board ranks, strongest first, with ranks 1..n. Strongest means the highest
+ *  expected value: the implied value times the token odds. */
+export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, oddsFit?: OddsFit): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const pricing = pricingReference(snapshot);
+  const odds = oddsFit ?? fitOdds(snapshot);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
   // board's coverage is the gate's row and is never gambled on a missing record).
@@ -311,7 +549,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, pricing, model);
+    const v = impliedValue(p, snapshot.as_of, pricing, odds.oddsBySlug.get(p.slug) ?? odds.baseRate, model);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -334,10 +572,14 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       // Full precision, not rounded: the dashboard recomputes the implied value from these same
       // factors and must land on the board's figure to the dollar.
       base_multiple: s.multiple,
+      multiple_n: s.multiple_n,
+      multiple_source: s.multiple_source,
       growth_pct: s.growthPct,
       growth_multiplier: s.growthMult,
       maturity_multiplier: s.maturityMult,
       breadth_multiplier: s.breadthMult,
+      gross_value_usd: s.gross,
+      token_odds: s.odds,
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -486,7 +728,7 @@ function actionsFor(p: SnapshotProtocol, capital: number, chain: string): [strin
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
+ * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
@@ -525,14 +767,18 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'no fee to check, and never pay to claim',
       time: '15 minutes',
     },
+    {
+      text: `If the TVL falls below $${Math.round(p.tvl_usd / 2).toLocaleString('en-US')}, half of its snapshot TVL, for two straight weeks, unwind the position and stop farming it.`,
+      cost: 'about $4 of gas to exit',
+      time: '15 minutes to exit',
+    },
   ];
 }
 // __FARM_END__
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
-  return snapshot.protocols
-    .filter((p) => !isPreToken(p) && p.category !== 'CEX' && p.mcap_usd !== null)
+  return liveAll(snapshot)
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .slice(0, LIVE_ROWS)
     .map((p) => ({
@@ -547,8 +793,48 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/** Every live-token protocol in the snapshot: the pool the detail view draws its peers from. */
+export function liveAll(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => !isPreToken(p) && p.category !== 'CEX' && p.mcap_usd !== null);
+}
+
+/** The three live-token protocols closest to a row's TVL: same category first, then the whole live
+ *  set, so a row is always priced against real market values, never in isolation. */
+export function peersFor(row: BoardRow, live: SnapshotProtocol[]): Peer[] {
+  const distance = (p: SnapshotProtocol): number => Math.abs(Math.log(Math.max(1, p.tvl_usd)) - Math.log(Math.max(1, row.tvl_usd)));
+  const taken = new Set<string>();
+  const peers: Peer[] = [];
+  const add = (p: SnapshotProtocol, same: boolean): void => {
+    if (peers.length >= 3 || taken.has(p.slug)) return;
+    taken.add(p.slug);
+    peers.push({
+      name: p.name,
+      category: p.category,
+      tvl_usd: p.tvl_usd,
+      mcap_usd: p.mcap_usd,
+      multiple: p.tvl_usd > 0 && p.mcap_usd !== null ? round4(p.mcap_usd / p.tvl_usd) : null,
+      same_category: same,
+    });
+  };
+  [...live]
+    .filter((p) => p.category !== null && p.category === row.category)
+    .sort((a, b) => distance(a) - distance(b))
+    .forEach((p) => add(p, true));
+  [...live].sort((a, b) => distance(a) - distance(b)).forEach((p) => add(p, p.category !== null && p.category === row.category));
+  return peers;
+}
+
+/** A row's farm verdict, from its rank: the top quarter by expected value is FARM, the bottom
+ *  quarter SKIP, the middle half MARGINAL. A relative verdict, not a promise: the detail view shows
+ *  the break-even allocation the verdict is worth. */
+export function verdictFor(rank: number, boardSize: number): 'FARM' | 'MARGINAL' | 'SKIP' {
+  if (rank <= Math.ceil(boardSize * 0.25)) return 'FARM';
+  if (rank <= Math.ceil(boardSize * 0.75)) return 'MARGINAL';
+  return 'SKIP';
+}
+
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
+export function radarRow(row: BoardRow, watchlist: boolean, live: SnapshotProtocol[], boardSize: number): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -561,30 +847,97 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    gross_value_usd: row.model.gross_value_usd,
+    token_odds: row.model.token_odds,
+    verdict: verdictFor(row.rank, boardSize),
     multiple: row.model.base_multiple,
+    multiple_n: row.model.multiple_n,
+    multiple_source: row.model.multiple_source,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     breadth_multiplier: row.model.breadth_multiplier,
     watchlist,
+    peers: peersFor(row, live),
   };
 }
 
-/** The multiples table the dashboard renders: categories with five or more tokened protocols set the multiple; the rest fall back to the global median. */
+/** The ledger: every protocol in the snapshot, ranked, live or excluded, with the reason. */
+export function ledgerRows(snapshot: Snapshot): LedgerRow[] {
+  return snapshot.protocols
+    .map((p) => {
+      const disposition: LedgerRow['disposition'] = isRankable(p) ? 'ranked' : !isPreToken(p) && passesScreen(p) ? 'live' : 'excluded';
+      return {
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        chains: p.chains,
+        tvl_usd: p.tvl_usd,
+        disposition,
+        reason: disposition === 'excluded' ? (excludeReason(p) ?? 'has a token') : null,
+      };
+    })
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
+}
+
+/** The multiples, tested held-out twice: category multiples against the global median and the v1
+ *  rule, on the live-token protocols' own market caps. The error is the mean |log| error on market
+ *  cap, so 1.7 means a typical miss by a factor of about five. */
+export function validateMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): Validation['multiples'] {
+  const ref = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.category !== 'CEX');
+  const meanLogErr: [number, number] = [0, 0];
+  const globalMeanLogErr: [number, number] = [0, 0];
+  const v1MeanLogErr: [number, number] = [0, 0];
+  for (const fold of [0, 1] as const) {
+    const train = ref.filter((p) => foldOf(p.slug) === fold);
+    const test = ref.filter((p) => foldOf(p.slug) !== fold);
+    const pricing = pricingReference({ ...snapshot, protocols: train });
+    const errs: number[] = [];
+    const gerrs: number[] = [];
+    const verrs: number[] = [];
+    for (const p of test) {
+      const m = multipleFor(p, pricing, model);
+      const global = pricing.global.median;
+      const v1 = Math.min(1.0, Math.max(0.03, m.n >= 5 && m.raw !== null ? m.raw : global));
+      errs.push(Math.abs(Math.log((p.tvl_usd * m.multiple) / p.mcap_usd!)));
+      gerrs.push(Math.abs(Math.log((p.tvl_usd * global) / p.mcap_usd!)));
+      verrs.push(Math.abs(Math.log((p.tvl_usd * v1) / p.mcap_usd!)));
+    }
+    const mean = (a: number[]): number => a.reduce((s, v) => s + v, 0) / a.length;
+    meanLogErr[fold] = mean(errs);
+    globalMeanLogErr[fold] = mean(gerrs);
+    v1MeanLogErr[fold] = mean(verrs);
+  }
+  return { mean_log_err: meanLogErr, global_mean_log_err: globalMeanLogErr, v1_mean_log_err: v1MeanLogErr, n: ref.length };
+}
+
+/** The multiples table the dashboard renders: every category with a live protocol, its own median
+ *  (capped) and the shrunk multiple the board is priced from; the rest fall back to the global median. */
 export function multiplesTable(snapshot: Snapshot, model: ModelConstants = MODEL): { multiples: MultipleRow[]; global: { n: number; median: number } } {
   const pricing = pricingReference(snapshot);
   const multiples: MultipleRow[] = [...pricing.byCategory.entries()]
-    .filter(([, v]) => v.n >= model.min_category_n)
-    .map(([category, v]) => ({ category, n: v.n, median: round4(v.median), used: true }))
+    .map(([category, v]) => {
+      const raw = Math.min(model.median_cap, Math.max(model.median_floor, v.median));
+      const shrunk = (v.n * raw + model.shrink_k * pricing.global.median) / (v.n + model.shrink_k);
+      return { category, n: v.n, median: round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk))), raw_median: round4(raw), used: true };
+    })
     .sort((a, b) => b.n - a.n || (a.category < b.category ? -1 : 1));
   return { multiples, global: { n: pricing.global.n, median: round4(pricing.global.median) } };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+  const odds = fitOdds(snapshot);
+  const board = buildBoard(snapshot, model, odds);
   const live = liveRows(snapshot);
+  const allLive = liveAll(snapshot);
   const { multiples, global } = multiplesTable(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const ledger = ledgerRows(snapshot);
+  const ledger_counts = {
+    ranked: ledger.filter((r) => r.disposition === 'ranked').length,
+    live: ledger.filter((r) => r.disposition === 'live').length,
+    excluded: ledger.filter((r) => r.disposition === 'excluded').length,
+  };
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -599,8 +952,20 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     multiples,
     global_multiple: global.median,
     global_n: global.n,
-    rows: board.map((r) => radarRow(r, snapshot.watchlist.includes(r.slug))),
+    rows: board.map((r) => radarRow(r, snapshot.watchlist.includes(r.slug), allLive, board.length)),
     live,
+    ledger,
+    ledger_counts,
+    validation: {
+      odds: {
+        brier: odds.validation.brier,
+        base_brier: odds.validation.baseBrier,
+        log_loss: odds.validation.logLoss,
+        base_log_loss: odds.validation.baseLogLoss,
+        base_rate: odds.baseRate,
+      },
+      multiples: validateMultiples(snapshot, model),
+    },
   };
   return { board, radar };
 }

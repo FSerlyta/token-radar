@@ -274,6 +274,58 @@ tbody td:last-child, thead th:last-child { padding-right: 16px; }
 }
 .pill.watch { background: var(--accent-soft); color: var(--accent); }
 .pill.live { background: #123a2a; color: var(--positive); }
+.pill.verdict.farm { background: #123a2a; color: var(--positive); }
+.pill.verdict.marginal { background: #3a2f10; color: var(--accent); }
+.pill.verdict.skip { background: var(--surface-3); color: var(--muted); }
+.pill.disp.ranked { background: #123a2a; color: var(--positive); }
+.pill.disp.live { background: #12283f; color: #7db4e8; }
+.pill.disp.excluded { background: var(--surface-3); color: var(--muted); }
+
+/* Integrity strip — the page's own checks, on the cover */
+
+.integrity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: baseline;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin: 14px 0 0;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+.integrity-title { color: var(--ink); font-weight: 650; }
+.integrity .check.pass { color: var(--positive); }
+.integrity .check.fail { color: var(--negative); font-weight: 700; }
+
+/* Validation table */
+
+.validation { margin: 0 0 16px; }
+.validation h3 { font-size: 14px; margin: 0 0 8px; color: var(--muted); font-weight: 650; text-transform: uppercase; letter-spacing: 0.05em; }
+.validation > p { color: var(--muted); font-size: 14px; margin: 0 0 10px; max-width: 70em; }
+.validation table { font-size: 13.5px; }
+.validation th, .validation td { padding: 7px 10px; }
+.validation tbody td:first-child { padding-left: 10px; }
+.validation thead th:first-child { padding-left: 10px; }
+
+/* Farm verdict and break-even in the detail dialog */
+
+.verdict-tag { font-size: 11.5px; font-weight: 800; letter-spacing: 0.04em; border-radius: 999px; padding: 2px 8px; vertical-align: 2px; margin-left: 6px; }
+.verdict-tag.farm { background: #123a2a; color: var(--positive); }
+.verdict-tag.marginal { background: #3a2f10; color: var(--accent); }
+.verdict-tag.skip { background: var(--surface-3); color: var(--muted); }
+.break-even {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 12px;
+}
+.break-even b { color: var(--ink); }
 .value { display: block; font-weight: 700; }
 .bar {
   display: block;
@@ -377,6 +429,30 @@ dialog.detail::backdrop { background: rgba(4, 8, 16, 0.72); backdrop-filter: blu
   flex: 0 0 auto;
 }
 .detail .body { padding: 16px 22px 22px; overflow-y: auto; }
+.why {
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  margin: 0 0 4px;
+}
+.why b { color: var(--accent); }
+.sub-note { color: var(--muted); font-size: 13.5px; margin: -2px 0 8px; }
+.peers { font-size: 13.5px; }
+.peers tbody td { padding: 7px 10px; }
+.peers tbody td:first-child { padding-left: 10px; }
+.peers tbody td:last-child { padding-right: 10px; }
+.risks { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.risks li {
+  border-left: 3px solid var(--negative);
+  background: var(--surface-2);
+  border-radius: 0 10px 10px 0;
+  padding: 9px 12px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.risks.clear li { border-left-color: var(--positive); }
 .detail h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 18px 0 8px; }
 .detail h3:first-child { margin-top: 0; }
 .detail table { font-size: 14px; }
